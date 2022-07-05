@@ -1,0 +1,208 @@
+---
+title: "PBMC scRNA clustering using Poisson factorization"
+author: "M Thomas"
+date: "04/07/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 15, fig.height = 9)
+
+library(Seurat)
+library(patchwork)
+library(poismf)
+library(philentropy)
+library(igraph)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(dbscan)
+library(plotly)
+library(RColorBrewer)
+library(xtable)
+
+set.seed(1234)
+```
+
+## Pre-Processing
+
+The pre-processing is from the Seurat tutorial: https://satijalab.org/seurat/articles/pbmc3k_tutorial.html
+
+
+```{r Pre-Processing}
+
+pbmc.data <- readRDS('10X_PBMC.RData')
+pbmc <- CreateSeuratObject(counts = pbmc.data, min.cells = 3, min.features = 200)
+
+# QC
+pbmc[['percent.mt']] <- PercentageFeatureSet(pbmc, pattern = '^MT-') # MT gene content
+pbmc <- subset(pbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5) # Remove low quality cells
+
+# Normalize and scale for feature plots
+pbmc <- NormalizeData(pbmc)
+all.genes <- rownames(pbmc)
+pbmc <- ScaleData(pbmc, features = all.genes)
+
+```
+
+## Compute Poisson factors
+
+96 PFs are computed from counts for clustering, 30 for visualization
+
+```{r Poisson Factors}
+
+# Get counts from Seurat object
+RNAdata <- pbmc@assays$RNA@counts
+RNAdata <- SeuratDisk::Transpose(RNAdata)
+RNAdata <- as.matrix(RNAdata)
+
+# Calc. PFs
+PF <- poismf(k=96, RNAdata, method="tncg")
+
+colnames(PF$B) <- colnames(RNAdata)
+colnames(PF$A) <- rownames(RNAdata)
+df_A <- t(as.matrix(PF$A))
+df_B <- t(as.matrix(PF$B))
+
+# Quick plot of first two PFs
+plot(df_A[,1], df_A[,2])
+
+# Add reduction to Seurat object
+pbmc[['hpf']] <- CreateDimReducObject(embeddings = df_A,
+                                       loadings = df_B,
+                                       key = 'pf_',
+                                       assay = 'RNA')
+
+
+# Repeat for visualization
+PF_viz <- poismf(k=30, RNAdata, method="tncg")
+colnames(PF_viz$B) <- colnames(RNAdata)
+colnames(PF_viz$A) <- rownames(RNAdata)
+
+df_A_viz <- t(as.matrix(PF_viz$A))
+df_B_viz <- t(as.matrix(PF_viz$B))
+
+pbmc[['pf_viz']] <- CreateDimReducObject(embeddings = df_A_viz,
+                                       loadings = df_B_viz,
+                                       key = 'pfviz_',
+                                       assay = 'RNA')
+
+```
+
+## Clustering
+
+Jensen-Shannon divergence is computed from counts giving a distance matrix. This is square rooted to produce the Jensen-Shannon distance.
+
+An RNN graph is constructed using a JSD radius of 0.5. Smaller radii will produce smaller clusters, however, this also produces lots more unclustered points/ very small clusters.
+The closest 25 points within the radius is kept
+
+The JSD is used for the edge weights of the RNN graph. Louvain clustering is then used to cluster the resulting graph.
+
+```{r Clustering}
+
+# Calculate Jensen-Shannon Distance distance matrix
+jsd <- sqrt(JSD(df_A, est.prob = 'empirical'))
+
+# Histogram for selecting RNN radius
+hist(jsd)
+
+# Generate RNN graph
+RNN <- frNN(jsd, 0.5, sort = T)$id
+RNN_capped <- lapply(RNN, head, 25) # only include 25 closest points 
+RNN_graph <- graph_from_adj_list(RNN_capped, mode = 'all', duplicate = F)
+
+# Add JSD as weights to graph
+edge_list <- as_edgelist(RNN_graph)
+E(RNN_graph)$weight <- mapply(function(x, y){jsd[x, y]}, edge_list[,1], edge_list[,2])
+
+# Louvain cluster RNN graph
+louvain <- cluster_louvain(RNN_graph)
+
+# Cluster counts
+table(louvain$membership)
+
+# Add cluster labels to Seurat object
+pbmc@meta.data$RNN_clusters <- louvain$membership
+
+```
+
+## Visualization
+
+UMAP for visualization using 30 PFs
+
+As many of the clusters have very few elements, to reduce the number of clusters being visualized there are two plots. All clusters with n > 10 are plotted separately to those with n < 10. Most of n < 10 contains unclusterd points [See table(louvain$membership)]
+
+
+```{r UMAP, fig.height=6, fig.width=9}
+# UMAP
+pbmc <- RunUMAP(pbmc, reduction = 'pf_viz', dims = 1:30)
+
+# Plot clusters (n > 10)
+pbmc_big <- subset(x = pbmc, subset = RNN_clusters %in% as.vector(which(table(pbmc@meta.data$RNN_clusters) > 10)))
+
+cluster_colour_big <- colorRampPalette(brewer.pal(11, 'RdYlBu'))(length(unique(pbmc_big@meta.data$RNN_clusters)))
+umap1 <- DimPlot(pbmc_big, reduction = "umap", group.by = 'RNN_clusters') +
+  scale_color_manual(values = cluster_colour_big) + 
+  theme_dark()
+ggplotly(umap1)
+
+# Plot small clusters (n <= 10); many have n = 1
+pbmc_small <- subset(x = pbmc, subset = RNN_clusters %in% as.vector(which(table(pbmc@meta.data$RNN_clusters) <= 10)))
+
+cluster_colour_small <- colorRampPalette(brewer.pal(11, 'RdYlBu'))(length(unique(pbmc_small@meta.data$RNN_clusters)))
+umap2 <- DimPlot(pbmc_small, reduction = "umap", group.by = 'RNN_clusters') +
+  scale_color_manual(values = cluster_colour_small) + 
+  theme_dark()
+ggplotly(umap2)
+```
+
+## Cluster validation
+
+From the plots below some biological groupings can be associated to the clusters. Markers used are present in the tutorial web page. Some clusters are well defined (e.g. B cells), others are not (CD4+/CD8+ cells).
+
+
+```{r Validation}
+
+# Normalized marker gene plot
+FeaturePlot(pbmc_big, features = c("IL7R", "CCR7", "CD14", "LYZ", "S100A4", 
+                                            "MS4A1", "CD8A", "FCGR3A", "MS4A7", "GNLY", 
+                                            "NKG7", "FCER1A", "CST3", "PPBP"
+                                         ), reduction = 'umap')
+
+# Normalized violin plot of markers
+VlnPlot(pbmc_big, features = c("IL7R", "CCR7", "CD14", "LYZ", "S100A4", 
+                           "MS4A1", "CD8A", "FCGR3A", "MS4A7", "GNLY", 
+                           "NKG7", "FCER1A", "CST3", "PPBP"
+                           ), log = TRUE, group.by = 'RNN_clusters')
+
+# Table generator
+Cells <- c('B', 'CD4+ T Naive', 'CD4+ Mem.', 'CD8T+', 'NK', 'DC', 'FCGR3A+ Mono', 'CD14+ Mono', 'Platlet')
+Markers <- c('MS4A1', 'IL7R, CCR7', 'IL7R, S100A4', 'CD8A', 'GNLY, NKG7', 'FCER1A, CST3', 'FCGR3A, MS4A7', 'CD14, LYZ', 'PPBP')
+Clusters <- c('2, 14', '6, 9, 12, 16', '1, 3, 13', '7, 10', '5', '17', '11', '4, 8, 20', 'individuals in pbmc_small')
+
+tab <- data.frame(Cells=Cells, Markers=Markers, Clusters=Clusters)
+
+tab
+
+# Label UMAP; 21 is an unidentified cluster
+Idents(pbmc_big) <- pbmc_big@meta.data$RNN_clusters
+new.ids <- c("Naive CD4+", "B", "Mem CD4+", "CD14+ Mono", "NK", 
+             "Mem CD4+", "CD8+ T", "CD14+ Mono", "Naive CD4+", "CD8+ T", 
+             "FCGR3A+ Mono", "Naive CD4+", "Mem CD4+", "B", "Naive CD4+",
+             "DC", "CD14+ Mono", "21")
+names(new.ids) <- levels(pbmc_big)
+pbmc_big <- RenameIdents(pbmc_big, new.ids)
+
+DimPlot(pbmc_big, reduction = 'umap', label = T, pt.size = 2) + NoLegend()
+
+
+```
+
+
+## Session info
+
+<details>
+```{r}
+  utils::sessionInfo()
+```
+</details>
